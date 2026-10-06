@@ -1,0 +1,59 @@
+name: build-llama-server-t4
+
+on:
+  workflow_dispatch:
+    inputs:
+      llama_ref:
+        description: "Branch/tag/commit ggml-org/llama.cpp"
+        default: "master"
+
+permissions:
+  contents: write 
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    container: nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+    steps:
+      - name: Dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git cmake build-essential ca-certificates curl
+
+      - name: Cloning llama.cpp
+        run: |
+          git clone https://github.com/ggml-org/llama.cpp
+          cd llama.cpp
+          git checkout "${{ inputs.llama_ref }}"
+          git config --global --add safe.directory '*'
+          echo "commit: $(git rev-parse HEAD)" > ../build-info.txt
+          cat ../build-info.txt
+
+      - name: Build (sm_75 only = T4)
+        run: |
+          cd llama.cpp
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES=75 \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DLLAMA_CURL=OFF \
+            -DCMAKE_LIBRARY_PATH=/usr/local/cuda/lib64/stubs
+          cmake --build build --config Release --target llama-server -j"$(nproc)"
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp llama.cpp/build/bin/llama-server dist/
+          cp build-info.txt dist/
+          tar -czf llama-server-cuda-sm75.tar.gz -C dist .
+          ls -lh llama-server-cuda-sm75.tar.gz
+
+      - name: Publishing to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: llama-cuda-t4
+          name: llama-server CUDA (T4, sm_75)
+          body_path: build-info.txt
+          files: llama-server-cuda-sm75.tar.gz
