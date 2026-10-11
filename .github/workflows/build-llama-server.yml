@@ -103,7 +103,7 @@ jobs:
             echo "commit: ${SHA}"
             echo "built: $(date -u +'%Y-%m-%d %H:%M') UTC"
             echo
-            echo "sm_75 = T4 (Kaggle), sm_80 = A100 (Colab), sm_120 = RTX PRO 6000 (G4)"
+            echo "sm_75 = T4, sm_80 = A100, sm_120 = G4 (RTX PRO 6000)"
           } > notes.txt
           gh release create "$TAG" dist/*.tar.gz \
             --title "llama-server CUDA ${TAG}" \
