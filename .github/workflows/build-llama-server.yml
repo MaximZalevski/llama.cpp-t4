@@ -1,42 +1,66 @@
-name: build-llama-server-t4
+name: build-llama-server-cuda
 
 on:
   workflow_dispatch:
     inputs:
       llama_ref:
-        description: "Branch/tag/commit ggml-org/llama.cpp"
+        description: "Branch, tag or commit of ggml-org/llama.cpp (empty = master)"
+        required: false
         default: "master"
+  schedule:
+    - cron: "0 3 * * 1"   # weekly, Monday 03:00 UTC; delete these two lines to turn it off
 
 permissions:
-  contents: write 
+  contents: write
+
+concurrency:
+  group: llama-release
+  cancel-in-progress: false
 
 jobs:
-  build:
+  prepare:
     runs-on: ubuntu-22.04
-    container: nvidia/cuda:12.4.1-devel-ubuntu22.04
-
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
     steps:
-      - name: Dependencies
+      - name: Resolve llama.cpp commit
+        id: resolve
+        run: |
+          git clone --quiet https://github.com/ggml-org/llama.cpp src
+          cd src
+          git checkout --quiet "${{ inputs.llama_ref || 'master' }}"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Building $(git rev-parse --short HEAD): $(git log -1 --format=%s)"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-22.04
+    container: nvidia/cuda:12.8.1-devel-ubuntu22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # 75 = T4, 80 = A100, 120 = G4 (RTX PRO 6000), "89" = L4
+        sm: ["75", "80", "120"]
+    steps:
+      - name: Install dependencies
         run: |
           apt-get update
           apt-get install -y --no-install-recommends git cmake build-essential ca-certificates curl
 
-      - name: Cloning llama.cpp
+      - name: Clone llama.cpp at the resolved commit
         run: |
-          git clone https://github.com/ggml-org/llama.cpp
-          cd llama.cpp
-          git checkout "${{ inputs.llama_ref }}"
+          git clone https://github.com/ggml-org/llama.cpp src
+          cd src
+          git checkout "${{ needs.prepare.outputs.sha }}"
           git config --global --add safe.directory '*'
-          echo "commit: $(git rev-parse HEAD)" > ../build-info.txt
-          cat ../build-info.txt
 
-      - name: Build (sm_75 only = T4)
+      - name: Build for sm_${{ matrix.sm }}
         run: |
-          cd llama.cpp
+          cd src
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DGGML_CUDA=ON \
-            -DCMAKE_CUDA_ARCHITECTURES=75 \
+            -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.sm }} \
             -DBUILD_SHARED_LIBS=OFF \
             -DLLAMA_CURL=OFF \
             -DCMAKE_LIBRARY_PATH=/usr/local/cuda/lib64/stubs
@@ -45,15 +69,43 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist
-          cp llama.cpp/build/bin/llama-server dist/
-          cp build-info.txt dist/
-          tar -czf llama-server-cuda-sm75.tar.gz -C dist .
-          ls -lh llama-server-cuda-sm75.tar.gz
+          cp src/build/bin/llama-server dist/
+          printf "commit: %s\ncuda_arch: sm_%s\n" "${{ needs.prepare.outputs.sha }}" "${{ matrix.sm }}" > dist/build-info.txt
+          tar -czf llama-server-cuda-sm${{ matrix.sm }}.tar.gz -C dist .
+          ls -lh llama-server-cuda-sm${{ matrix.sm }}.tar.gz
 
-      - name: Publishing to Release
-        uses: softprops/action-gh-release@v2
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: llama-cuda-t4
-          name: llama-server CUDA (T4, sm_75)
-          body_path: build-info.txt
-          files: llama-server-cuda-sm75.tar.gz
+          name: llama-server-cuda-sm${{ matrix.sm }}
+          path: llama-server-cuda-sm${{ matrix.sm }}.tar.gz
+          retention-days: 3
+
+  release:
+    needs: [prepare, build]   # if any build fails, no release is created
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download all builds
+        uses: actions/download-artifact@v4
+        with:
+          pattern: llama-server-cuda-sm*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release (marked as latest)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          TAG="llama-cuda-$(date -u +%Y%m%d-%H%M)-${SHA:0:7}"
+          {
+            echo "commit: ${SHA}"
+            echo "built: $(date -u +'%Y-%m-%d %H:%M') UTC"
+            echo
+            echo "sm_75 = T4 (Kaggle), sm_80 = A100 (Colab), sm_120 = RTX PRO 6000 (G4)"
+          } > notes.txt
+          gh release create "$TAG" dist/*.tar.gz \
+            --title "llama-server CUDA ${TAG}" \
+            --notes-file notes.txt \
+            --latest
