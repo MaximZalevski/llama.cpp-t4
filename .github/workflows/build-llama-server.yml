@@ -1,14 +1,25 @@
 name: build-llama-server-cuda
 
+# fork = mainline -> ggml-org/llama.cpp     -> release marked "Latest"
+# fork = prism    -> PrismML-Eng/llama.cpp  -> prerelease with fixed tag prism-cuda (Bonsai)
+# The weekly schedule builds mainline. Only sm_75 (T4) is built.
+
 on:
   workflow_dispatch:
     inputs:
+      fork:
+        description: "Which llama.cpp to build"
+        type: choice
+        options:
+          - mainline
+          - prism
+        default: mainline
       llama_ref:
-        description: "Branch, tag or commit of ggml-org/llama.cpp (empty = master)"
+        description: "Branch, tag or commit (empty = master for mainline, prism for prism)"
         required: false
-        default: "master"
+        default: ""
   schedule:
-    - cron: "0 3 * * 1"   # weekly, Monday 03:00 UTC; delete these two lines to turn it off
+    - cron: "0 3 * * 1"   # weekly mainline build, Monday 03:00 UTC; delete these two lines to turn it off
 
 permissions:
   contents: write
@@ -21,16 +32,38 @@ jobs:
   prepare:
     runs-on: ubuntu-22.04
     outputs:
+      fork: ${{ steps.resolve.outputs.fork }}
+      repo: ${{ steps.resolve.outputs.repo }}
+      prefix: ${{ steps.resolve.outputs.prefix }}
       sha: ${{ steps.resolve.outputs.sha }}
     steps:
-      - name: Resolve llama.cpp commit
+      - name: Resolve source and commit
         id: resolve
+        env:
+          FORK: ${{ inputs.fork || 'mainline' }}
+          REF_INPUT: ${{ inputs.llama_ref }}
         run: |
-          git clone --quiet https://github.com/ggml-org/llama.cpp src
+          if [ "$FORK" = "prism" ]; then
+            REPO=https://github.com/PrismML-Eng/llama.cpp
+            REF=${REF_INPUT:-prism}
+            PREFIX=llama-server-prism-cuda
+          else
+            FORK=mainline
+            REPO=https://github.com/ggml-org/llama.cpp
+            REF=${REF_INPUT:-master}
+            PREFIX=llama-server-cuda
+          fi
+          git clone --quiet "$REPO" src
           cd src
-          git checkout --quiet "${{ inputs.llama_ref || 'master' }}"
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "Building $(git rev-parse --short HEAD): $(git log -1 --format=%s)"
+          git checkout --quiet "$REF"
+          SHA=$(git rev-parse HEAD)
+          echo "Building $FORK @ $(git rev-parse --short HEAD): $(git log -1 --format=%s)"
+          {
+            echo "fork=$FORK"
+            echo "repo=$REPO"
+            echo "prefix=$PREFIX"
+            echo "sha=$SHA"
+          } >> "$GITHUB_OUTPUT"
 
   build:
     needs: prepare
@@ -39,22 +72,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 75 = T4, 80 = A100, 120 = G4 (RTX PRO 6000), "89" = L4
-        sm: ["75"]
+        sm: ["75"]   # 75 = T4
     steps:
       - name: Install dependencies
         run: |
           apt-get update
           apt-get install -y --no-install-recommends git cmake build-essential ca-certificates curl
 
-      - name: Clone llama.cpp at the resolved commit
+      - name: Clone at the resolved commit
         run: |
-          git clone https://github.com/ggml-org/llama.cpp src
+          git clone "${{ needs.prepare.outputs.repo }}" src
           cd src
           git checkout "${{ needs.prepare.outputs.sha }}"
           git config --global --add safe.directory '*'
 
-      - name: Build for sm_${{ matrix.sm }}
+      - name: Build llama-server for sm_${{ matrix.sm }}
         run: |
           cd src
           cmake -B build \
@@ -62,7 +94,8 @@ jobs:
             -DGGML_CUDA=ON \
             -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.sm }} \
             -DBUILD_SHARED_LIBS=OFF \
-            -DLLAMA_CURL=OFF \
+            -DLLAMA_OPENSSL=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
             -DCMAKE_LIBRARY_PATH=/usr/local/cuda/lib64/stubs
           cmake --build build --config Release --target llama-server -j"$(nproc)"
 
@@ -70,29 +103,30 @@ jobs:
         run: |
           mkdir -p dist
           cp src/build/bin/llama-server dist/
-          printf "commit: %s\ncuda_arch: sm_%s\n" "${{ needs.prepare.outputs.sha }}" "${{ matrix.sm }}" > dist/build-info.txt
-          tar -czf llama-server-cuda-sm${{ matrix.sm }}.tar.gz -C dist .
-          ls -lh llama-server-cuda-sm${{ matrix.sm }}.tar.gz
+          printf "fork: %s\ncommit: %s\ncuda_arch: sm_%s\n" "${{ needs.prepare.outputs.fork }}" "${{ needs.prepare.outputs.sha }}" "${{ matrix.sm }}" > dist/build-info.txt
+          tar -czf ${{ needs.prepare.outputs.prefix }}-sm${{ matrix.sm }}.tar.gz -C dist .
+          ls -lh ${{ needs.prepare.outputs.prefix }}-sm${{ matrix.sm }}.tar.gz
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: llama-server-cuda-sm${{ matrix.sm }}
-          path: llama-server-cuda-sm${{ matrix.sm }}.tar.gz
+          name: ${{ needs.prepare.outputs.prefix }}-sm${{ matrix.sm }}
+          path: ${{ needs.prepare.outputs.prefix }}-sm${{ matrix.sm }}.tar.gz
           retention-days: 3
 
   release:
-    needs: [prepare, build]   # if any build fails, no release is created
+    needs: [prepare, build]   # if the build fails, nothing is published
     runs-on: ubuntu-22.04
     steps:
-      - name: Download all builds
+      - name: Download build
         uses: actions/download-artifact@v4
         with:
-          pattern: llama-server-cuda-sm*
+          pattern: ${{ needs.prepare.outputs.prefix }}-sm*
           path: dist
           merge-multiple: true
 
-      - name: Publish release (marked as latest)
+      - name: Publish mainline (new release, marked Latest)
+        if: needs.prepare.outputs.fork == 'mainline'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -103,9 +137,29 @@ jobs:
             echo "commit: ${SHA}"
             echo "built: $(date -u +'%Y-%m-%d %H:%M') UTC"
             echo
-            echo "sm_75 = T4, sm_80 = A100, sm_120 = G4 (RTX PRO 6000)"
+            echo "sm_75 = T4"
           } > notes.txt
           gh release create "$TAG" dist/*.tar.gz \
             --title "llama-server CUDA ${TAG}" \
             --notes-file notes.txt \
             --latest
+
+      - name: Publish prism (prerelease, fixed tag prism-cuda)
+        if: needs.prepare.outputs.fork == 'prism'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          {
+            echo "fork: PrismML-Eng/llama.cpp"
+            echo "commit: ${SHA}"
+            echo "built: $(date -u +'%Y-%m-%d %H:%M') UTC"
+            echo
+            echo "sm_75 = T4. The notebook downloads this release for engine=prism (Bonsai)."
+          } > notes.txt
+          if ! gh release view prism-cuda >/dev/null 2>&1; then
+            gh release create prism-cuda --prerelease --title "PrismML llama-server (CUDA)" --notes-file notes.txt
+          fi
+          gh release upload prism-cuda dist/*.tar.gz --clobber
+          gh release edit prism-cuda --notes-file notes.txt
