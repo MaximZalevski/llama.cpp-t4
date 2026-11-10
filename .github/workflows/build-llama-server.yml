@@ -40,7 +40,7 @@ jobs:
       fail-fast: false
       matrix:
         # 75 = T4, 80 = A100, 120 = G4 (RTX PRO 6000), "89" = L4
-        sm: ["75", "80", "120"]
+        sm: ["75"]
     steps:
       - name: Install dependencies
         run: |
